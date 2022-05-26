@@ -68,7 +68,7 @@ fn main() -> Result<(), ()> {
         cfg.define("TRT7", "");
         let bindings = builder()
             .clang_arg("-DTRT7")
-            .clang_args(&["-x", "c++"])
+            .clang_args(&["-x", "c++", "-I", "/usr/local/cuda/include"])
             .header("trt-sys/tensorrt_api.h")
             .size_t_is_usize(true)
             .generate()?;
