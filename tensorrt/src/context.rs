@@ -1,7 +1,7 @@
 use crate::check_cuda;
 use crate::profiler::{IProfiler, Profiler};
 use anyhow::Error;
-use cuda_runtime_sys::{cudaFree, cudaMalloc, cudaMemcpy, cudaMemcpyKind};
+use cuda_runtime_sys::{cudaFree, cudaMalloc, cudaMemcpy, cudaMemcpyKind, cudaStream_t, cudaMemcpyAsync};
 use ndarray;
 use ndarray::Dimension;
 use num_traits::Num;
@@ -12,7 +12,7 @@ use std::ptr;
 use std::vec::Vec;
 use tensorrt_sys::{
     context_get_debug_sync, context_get_name, context_set_debug_sync, context_set_name,
-    context_set_profiler, destroy_excecution_context, execute, nvinfer1_IExecutionContext,
+    context_set_profiler, destroy_excecution_context, enqueue, execute, nvinfer1_IExecutionContext,
 };
 
 pub enum ExecuteInput<'a, D: Dimension> {
@@ -20,57 +20,120 @@ pub enum ExecuteInput<'a, D: Dimension> {
     Float(&'a mut ndarray::Array<f32, D>),
 }
 
-struct DeviceBuffer {
-    device_ptr: *mut c_void,
+pub struct DeviceBuffer {
+    device_ptr: ptr::Unique<c_void>, // to make the type sendable
+    size: usize
 }
 
 impl DeviceBuffer {
     pub fn new<T: Num, D: Dimension>(host_data: &ndarray::Array<T, D>) -> Result<Self, Error> {
         let mut device_ptr: *mut c_void = ptr::null_mut();
+        let size = host_data.len() * size_of::<T>();
         check_cuda!(cudaMalloc(
             &mut device_ptr,
-            host_data.len() * size_of::<T>()
+            size
         ));
 
         check_cuda!(cudaMemcpy(
             device_ptr,
             host_data.as_ptr() as *const c_void,
-            host_data.len() * size_of::<T>(),
+            size,
             cudaMemcpyKind::cudaMemcpyHostToDevice,
         ));
 
-        Ok(DeviceBuffer { device_ptr })
+        let device_ptr = ptr::Unique::new(device_ptr).unwrap();
+        Ok(DeviceBuffer { device_ptr , size })
     }
 
     pub fn new_uninit(size: usize) -> Result<Self, Error> {
         let mut device_ptr: *mut c_void = ptr::null_mut();
         check_cuda!(cudaMalloc(&mut device_ptr, size));
-        Ok(DeviceBuffer { device_ptr })
+        let device_ptr = ptr::Unique::new(device_ptr).unwrap();
+        Ok(DeviceBuffer { device_ptr, size })
     }
 
     pub fn as_mut_ptr(&self) -> *mut c_void {
-        self.device_ptr
+        unsafe {self.device_ptr.as_ref() as *const c_void as *mut c_void}
     }
 
     pub fn copy_to_host<T: Num, D: Dimension>(
-        &self,
+        &mut self,
         host_data: &mut ndarray::Array<T, D>,
     ) -> Result<(), Error> {
+        self.check_host_buffer_size(host_data)?;
         check_cuda!(cudaMemcpy(
             host_data.as_mut_ptr() as *mut c_void,
-            self.device_ptr,
-            host_data.len() * size_of::<T>(),
+            self.as_mut_ptr(),
+            self.size,
             cudaMemcpyKind::cudaMemcpyDeviceToHost,
         ));
         Ok(())
+    }
+
+    pub fn copy_from_host<T: Num, D: Dimension>(
+        &self,
+        host_data: &mut ndarray::Array<T, D>,
+    ) -> Result<(), Error> {
+        self.check_host_buffer_size(host_data)?;
+        check_cuda!(cudaMemcpy(
+            self.as_mut_ptr(),
+            host_data.as_mut_ptr() as *mut c_void,
+            self.size,
+            cudaMemcpyKind::cudaMemcpyHostToDevice,
+        ));
+        Ok(())
+    }
+
+    pub fn copy_to_host_async<T: Num, D: Dimension>(
+        &self,
+        host_data: &mut ndarray::Array<T, D>,
+        stream: cudaStream_t
+    ) -> Result<(), Error> {
+        self.check_host_buffer_size(host_data)?;
+        check_cuda!(cudaMemcpyAsync(
+            host_data.as_mut_ptr() as *mut c_void,
+            self.as_mut_ptr(),
+            self.size,
+            cudaMemcpyKind::cudaMemcpyDeviceToHost,
+            stream,
+        ));
+        Ok(())
+    }
+
+    pub fn copy_from_host_async<T: Num, D: Dimension>(
+        &self,
+        host_data: &mut ndarray::Array<T, D>,
+        stream: cudaStream_t
+    ) -> Result<(), Error> {
+        self.check_host_buffer_size(host_data)?;
+        check_cuda!(cudaMemcpyAsync(
+            self.as_mut_ptr(),
+            host_data.as_mut_ptr() as *mut c_void,
+            self.size,
+            cudaMemcpyKind::cudaMemcpyHostToDevice,
+            stream,
+        ));
+        Ok(())
+    }
+
+    fn check_host_buffer_size<T: Num, D: Dimension>(
+        &self,
+        host_data: &ndarray::Array<T, D>,
+    ) -> Result<(), Error> {
+        let host_data_size = host_data.len() * size_of::<T>();
+        if host_data_size != self.size {
+            Err(anyhow::anyhow!("host data size({}) does not match device buffer size({})", host_data_size, self.size))
+        } else {
+            Ok(())
+        }
     }
 }
 
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
-        if !self.device_ptr.is_null() {
+        if !self.as_mut_ptr().is_null() {
             unsafe {
-                cudaFree(self.device_ptr);
+                cudaFree(self.device_ptr.as_ptr());
             }
         }
     }
@@ -118,6 +181,22 @@ impl Context {
     //     }
     // }
 
+    pub fn enqueue(
+        &self,
+        bindings: &Vec<DeviceBuffer>,
+        stream: cudaStream_t,   
+    ) -> Result<(), Error> {
+        let mut buffers = bindings
+            .iter()
+            .map(|elem| elem.as_mut_ptr())
+            .collect::<Vec<*mut c_void>>();
+
+        unsafe {
+            enqueue(self.internal_context, buffers.as_mut_ptr(), 1, stream as tensorrt_sys::cudaStream_t);
+        }
+        Ok(())
+    }
+
     pub fn execute<D1: Dimension, D2: Dimension>(
         &self,
         input_data: ExecuteInput<D1>,
@@ -149,7 +228,7 @@ impl Context {
             execute(self.internal_context, bindings.as_mut_ptr(), 1);
         }
 
-        for (idx, output) in buffers.iter().skip(1).enumerate() {
+        for (idx, output) in buffers.iter_mut().skip(1).enumerate() {
             let data = &mut output_data[idx];
             match data {
                 ExecuteInput::Integer(val) => {

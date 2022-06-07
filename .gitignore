@@ -6,3 +6,4 @@ Cargo.lock
 *.engine
 assets/
 tensorrt-sys/src/bindings.rs
+.vscode

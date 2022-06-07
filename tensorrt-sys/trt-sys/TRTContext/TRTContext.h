@@ -27,6 +27,7 @@ void context_set_profiler(nvinfer1::IExecutionContext* execution_context, CppPro
 
 void execute(nvinfer1::IExecutionContext* execution_context, void** buffers, int batch_size);
 
+void enqueue(nvinfer1::IExecutionContext* execution_context, void** buffers, int batch_size, cudaStream_t stream);
 
 #endif //LIBTRT_TRTCONTEXT_H
 

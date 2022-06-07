@@ -1,6 +1,7 @@
 //
 // Created by mason on 9/17/19.
 //
+#include <chrono>
 #include <cuda_runtime.h>
 #include "NvInfer.h"
 #include "TRTContext.h"
@@ -59,4 +60,8 @@ void context_set_profiler(nvinfer1::IExecutionContext *context, CppProfiler* pro
 
 void execute(nvinfer1::IExecutionContext *execution_context, void **buffers, int batch_size) {
     execution_context->execute(batch_size, &buffers[0]);
+}
+
+void enqueue(nvinfer1::IExecutionContext* execution_context, void** buffers, int batch_size, cudaStream_t s) {
+    execution_context->enqueue(batch_size, &buffers[0], s, nullptr);
 }
